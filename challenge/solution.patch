@@ -1,8 +1,8 @@
 diff --git a/kubernetes/base/watch/watch.py b/kubernetes/base/watch/watch.py
-index 44fbe491..8898d643 100644
+index 44fbe491..2467f5d4 100644
 --- a/kubernetes/base/watch/watch.py
 +++ b/kubernetes/base/watch/watch.py
-@@ -52,35 +52,26 @@ def _find_return_type(func):
+@@ -52,36 +52,26 @@ def _find_return_type(func):
  
  
  def iter_resp_lines(resp):
@@ -51,9 +51,636 @@ index 44fbe491..8898d643 100644
 +
 +        for line in lines:
 +            yield line.decode('utf-8', errors='replace')
-+
+ 
 +    if pending:
 +        yield pending.decode('utf-8', errors='replace')
  
- 
  class Watch(object):
+ 
+diff --git a/kubernetes/base/watch/watch_shipd_stream_test.py b/kubernetes/base/watch/watch_shipd_stream_test.py
+new file mode 100644
+index 00000000..8eb78810
+--- /dev/null
++++ b/kubernetes/base/watch/watch_shipd_stream_test.py
+@@ -0,0 +1,555 @@
++# Copyright 2024 The Kubernetes Authors.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Tests for robust chunk-boundary handling in kubernetes.watch.
++
++These tests verify that iter_resp_lines correctly reassembles newline-delimited
++JSON events that have been split across arbitrary transport chunk boundaries, and
++that Watch.stream yields correctly ordered, complete events regardless of how the
++underlying HTTP transport frames the response body.
++"""
++
++import json
++import unittest
++from unittest.mock import Mock
++
++from kubernetes.watch.watch import Watch, iter_resp_lines
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++def _fake_resp(chunks):
++    """Build a minimal fake response whose .stream() returns *chunks*."""
++    resp = Mock()
++    resp.close = Mock()
++    resp.release_conn = Mock()
++    resp.stream = Mock(return_value=chunks)
++    return resp
++
++
++def _fake_api(resp, return_type_doc):
++    """Return a (fake_api, method_mock) pair whose method yields *resp*."""
++    api = Mock()
++    api.list_resources = Mock(return_value=resp)
++    api.list_resources.__doc__ = return_type_doc
++    return api
++
++
++# ---------------------------------------------------------------------------
++# Direct unit tests for iter_resp_lines
++# ---------------------------------------------------------------------------
++
++class IterRespLinesTests(unittest.TestCase):
++    """Unit tests for the iter_resp_lines() generator.
++
++    These tests call iter_resp_lines directly so that failures are
++    unambiguously attributable to the chunk-parsing layer rather than to
++    higher-level Watch logic.
++    """
++
++    # -- basic sanity --------------------------------------------------------
++
++    def test_single_complete_event(self):
++        """A single chunk containing one complete newline-terminated line."""
++        resp = _fake_resp([b'{"type":"ADDED","object":{}}\n'])
++        lines = list(iter_resp_lines(resp))
++        self.assertEqual(1, len(lines))
++        self.assertEqual('{"type":"ADDED","object":{}}', lines[0])
++
++    def test_single_str_chunk(self):
++        """iter_resp_lines must accept str chunks, not just bytes."""
++        resp = _fake_resp(['{"type":"ADDED","object":{}}\n'])
++        lines = list(iter_resp_lines(resp))
++        self.assertEqual(1, len(lines))
++
++    def test_mixed_bytes_and_str_chunks(self):
++        """Bytes and str chunks may be interleaved within one event."""
++        resp = _fake_resp([
++            b'{"type":"ADDED","object":{"metadata":{"name":"mix",',
++            '"resourceVersion":"1"}}}\n',
++        ])
++        lines = list(iter_resp_lines(resp))
++        self.assertEqual(1, len(lines))
++        parsed = json.loads(lines[0])
++        self.assertEqual('mix', parsed['object']['metadata']['name'])
++
++    # -- split events --------------------------------------------------------
++
++    def test_event_split_across_two_chunks(self):
++        """An event whose bytes span exactly two chunks must be emitted once."""
++        full = b'{"type":"ADDED","object":{"metadata":{"name":"pod-a","resourceVersion":"10"}}}\n'
++        mid = len(full) // 2
++        resp = _fake_resp([full[:mid], full[mid:]])
++        lines = list(iter_resp_lines(resp))
++        self.assertEqual(1, len(lines))
++        parsed = json.loads(lines[0])
++        self.assertEqual('pod-a', parsed['object']['metadata']['name'])
++
++    def test_event_split_across_three_chunks(self):
++        """An event split into three chunks must be reconstructed correctly."""
++        full = b'{"type":"MODIFIED","object":{"metadata":{"name":"pod-b","resourceVersion":"20"}}}\n'
++        a, b_, c = full[:15], full[15:40], full[40:]
++        resp = _fake_resp([a, b_, c])
++        lines = list(iter_resp_lines(resp))
++        self.assertEqual(1, len(lines))
++        parsed = json.loads(lines[0])
++        self.assertEqual('pod-b', parsed['object']['metadata']['name'])
++
++    def test_event_split_into_single_byte_chunks(self):
++        """Extreme case: every byte in its own chunk."""
++        full = b'{"type":"ADDED","object":{"metadata":{"name":"pod-c","resourceVersion":"30"}}}\n'
++        resp = _fake_resp([bytes([b]) for b in full])
++        lines = list(iter_resp_lines(resp))
++        self.assertEqual(1, len(lines))
++        parsed = json.loads(lines[0])
++        self.assertEqual('pod-c', parsed['object']['metadata']['name'])
++
++    # -- multiple events per chunk -------------------------------------------
++
++    def test_two_events_in_one_chunk(self):
++        """Two complete newline-terminated events in a single chunk."""
++        chunk = (
++            b'{"type":"ADDED","object":{"metadata":{"name":"alpha","resourceVersion":"1"}}}\n'
++            b'{"type":"DELETED","object":{"metadata":{"name":"beta","resourceVersion":"2"}}}\n'
++        )
++        resp = _fake_resp([chunk])
++        lines = list(iter_resp_lines(resp))
++        self.assertEqual(2, len(lines))
++        self.assertIn('"alpha"', lines[0])
++        self.assertIn('"beta"', lines[1])
++
++    def test_five_events_in_one_chunk(self):
++        """Five complete events concatenated into one chunk; order must be preserved."""
++        names = ['a', 'b', 'c', 'd', 'e']
++        chunk = b''.join(
++            ('{"type":"ADDED","object":{"metadata":{"name":"%s","resourceVersion":"%d"}}}\n' % (n, i + 1)).encode()
++            for i, n in enumerate(names)
++        )
++        resp = _fake_resp([chunk])
++        lines = list(iter_resp_lines(resp))
++        self.assertEqual(5, len(lines))
++        for i, name in enumerate(names):
++            parsed = json.loads(lines[i])
++            self.assertEqual(name, parsed['object']['metadata']['name'])
++
++    # -- empty and zero-byte chunks ------------------------------------------
++
++    def test_empty_bytes_chunk_between_events(self):
++        """Zero-byte chunks must not produce output or corrupt state."""
++        resp = _fake_resp([
++            b'{"type":"ADDED","object":{"metadata":{"name":"x","resourceVersion":"1"}}}\n',
++            b'',
++            b'{"type":"ADDED","object":{"metadata":{"name":"y","resourceVersion":"2"}}}\n',
++        ])
++        lines = [l for l in iter_resp_lines(resp) if l]
++        self.assertEqual(2, len(lines))
++        self.assertIn('"x"', lines[0])
++        self.assertIn('"y"', lines[1])
++
++    def test_multiple_consecutive_empty_chunks(self):
++        """Several consecutive empty chunks between valid events."""
++        resp = _fake_resp([
++            b'',
++            b'',
++            b'{"type":"ADDED","object":{"metadata":{"name":"z","resourceVersion":"1"}}}\n',
++            b'',
++            b'',
++        ])
++        lines = [l for l in iter_resp_lines(resp) if l]
++        self.assertEqual(1, len(lines))
++
++    def test_empty_lines_between_events(self):
++        """Bare newline chunks (keepalive lines) are yielded as empty strings."""
++        resp = _fake_resp([
++            b'\n',
++            b'{"type":"ADDED","object":{"metadata":{"name":"w","resourceVersion":"1"}}}\n',
++            b'\n',
++        ])
++        lines = list(iter_resp_lines(resp))
++        # There should be exactly one non-empty line (the event), plus empty
++        # strings for the bare newlines.
++        non_empty = [l for l in lines if l]
++        self.assertEqual(1, len(non_empty))
++        self.assertIn('"w"', non_empty[0])
++
++    # -- UTF-8 multibyte characters split across chunk boundaries ------------
++
++    def test_utf8_two_byte_char_split(self):
++        """©  (U+00A9) is \xC2\xA9; split between the two bytes."""
++        # Build the raw bytes for a complete event that contains © in a value.
++        event_str = (
++            '{"type":"MODIFIED","object":{"metadata":{"name":"cfg-1",'
++            '"resourceVersion":"42"},"data":{"license":"\u00a9 2024"}}}\n'
++        )
++        raw = event_str.encode('utf-8')
++        # Locate the © and split after the first byte (\xC2).
++        copy_idx = raw.index(b'\xc2')
++        resp = _fake_resp([raw[:copy_idx + 1], raw[copy_idx + 1:]])
++
++        lines = list(iter_resp_lines(resp))
++        self.assertEqual(1, len(lines))
++        parsed = json.loads(lines[0])
++        self.assertEqual('\u00a9 2024', parsed['object']['data']['license'])
++
++    def test_utf8_three_byte_char_split_after_first_byte(self):
++        """€ (U+20AC) is \xE2\x82\xAC; split after byte 1."""
++        event_str = (
++            '{"type":"MODIFIED","object":{"metadata":{"name":"cfg-2",'
++            '"resourceVersion":"43"},"data":{"price":"\u20ac 9.99"}}}\n'
++        )
++        raw = event_str.encode('utf-8')
++        euro_idx = raw.index(b'\xe2')
++        # chunk1 ends with \xE2 (first of three bytes)
++        resp = _fake_resp([raw[:euro_idx + 1], raw[euro_idx + 1:]])
++        lines = list(iter_resp_lines(resp))
++        self.assertEqual(1, len(lines))
++        parsed = json.loads(lines[0])
++        self.assertEqual('\u20ac 9.99', parsed['object']['data']['price'])
++
++    def test_utf8_three_byte_char_split_after_second_byte(self):
++        """€ (U+20AC) is \xE2\x82\xAC; split after byte 2."""
++        event_str = (
++            '{"type":"MODIFIED","object":{"metadata":{"name":"cfg-3",'
++            '"resourceVersion":"44"},"data":{"price":"\u20ac 19.99"}}}\n'
++        )
++        raw = event_str.encode('utf-8')
++        euro_idx = raw.index(b'\xe2')
++        # chunk1 ends with \xE2\x82 (first two of three bytes)
++        resp = _fake_resp([raw[:euro_idx + 2], raw[euro_idx + 2:]])
++        lines = list(iter_resp_lines(resp))
++        self.assertEqual(1, len(lines))
++        parsed = json.loads(lines[0])
++        self.assertEqual('\u20ac 19.99', parsed['object']['data']['price'])
++
++    def test_utf8_four_byte_char_split(self):
++        """😄 (U+1F604) is \xF0\x9F\x98\x84; split after byte 2."""
++        event_str = (
++            '{"type":"MODIFIED","object":{"metadata":{"name":"cfg-4",'
++            '"resourceVersion":"45"},"data":{"emoji":"\U0001f604"}}}\n'
++        )
++        raw = event_str.encode('utf-8')
++        emoji_idx = raw.index(b'\xf0')
++        resp = _fake_resp([raw[:emoji_idx + 2], raw[emoji_idx + 2:]])
++        lines = list(iter_resp_lines(resp))
++        self.assertEqual(1, len(lines))
++        parsed = json.loads(lines[0])
++        self.assertEqual('\U0001f604', parsed['object']['data']['emoji'])
++
++    def test_utf8_multibyte_split_and_subsequent_event(self):
++        """After recovering a split multibyte char, the next event arrives cleanly."""
++        # Two events; first has a split ©, second is clean.
++        e1 = '{"type":"MODIFIED","object":{"metadata":{"name":"m1","resourceVersion":"1"},"data":{"k":"\u00a9"}}}\n'
++        e2 = '{"type":"ADDED","object":{"metadata":{"name":"m2","resourceVersion":"2"}}}\n'
++        raw = (e1 + e2).encode('utf-8')
++        # Split at the © boundary
++        copy_idx = raw.index(b'\xc2')
++        resp = _fake_resp([raw[:copy_idx + 1], raw[copy_idx + 1:]])
++        lines = list(iter_resp_lines(resp))
++        self.assertEqual(2, len(lines))
++        p1 = json.loads(lines[0])
++        p2 = json.loads(lines[1])
++        self.assertEqual('m1', p1['object']['metadata']['name'])
++        self.assertEqual('\u00a9', p1['object']['data']['k'])
++        self.assertEqual('m2', p2['object']['metadata']['name'])
++
++    # -- ordering preservation -----------------------------------------------
++
++    def test_ordering_with_irregular_chunk_sizes(self):
++        """10 sequential events delivered in irregular chunk sizes; order must match."""
++        events = [
++            '{"type":"ADDED","object":{"metadata":{"name":"pod-%02d","resourceVersion":"%d"}}}\n' % (i, i)
++            for i in range(10)
++        ]
++        data = ''.join(events).encode('utf-8')
++        # Irregular split sizes designed to cross every event boundary at least once.
++        sizes = [7, 13, 31, 42, 17, 28, 51, 33, 19, 11, 64, 29, 37]
++        chunks = []
++        pos = 0
++        for size in sizes:
++            if pos < len(data):
++                chunks.append(data[pos:pos + size])
++                pos += size
++        if pos < len(data):
++            chunks.append(data[pos:])
++
++        resp = _fake_resp(chunks)
++        lines = [l for l in iter_resp_lines(resp) if l]
++        self.assertEqual(10, len(lines))
++        for i, line in enumerate(lines):
++            parsed = json.loads(line)
++            self.assertEqual('pod-%02d' % i, parsed['object']['metadata']['name'])
++
++    def test_ordering_single_byte_chunks(self):
++        """3 events, each byte in its own chunk — order must be exact."""
++        events = [
++            '{"type":"ADDED","object":{"metadata":{"name":"s%d","resourceVersion":"%d"}}}\n' % (i, i)
++            for i in range(3)
++        ]
++        data = ''.join(events).encode('utf-8')
++        resp = _fake_resp([bytes([b]) for b in data])
++        lines = [l for l in iter_resp_lines(resp) if l]
++        self.assertEqual(3, len(lines))
++        for i, line in enumerate(lines):
++            parsed = json.loads(line)
++            self.assertEqual('s%d' % i, parsed['object']['metadata']['name'])
++
++    # -- type safety ---------------------------------------------------------
++
++    def test_invalid_segment_type_raises_type_error(self):
++        """A non-bytes, non-str segment must raise TypeError."""
++        resp = _fake_resp([12345])
++        with self.assertRaises(TypeError):
++            list(iter_resp_lines(resp))
++
++    def test_invalid_segment_type_does_not_swallow_previous_buffer(self):
++        """TypeError propagates even after partial data has been buffered."""
++        resp = _fake_resp([b'{"type":"ADDED"', 99999])
++        with self.assertRaises(TypeError):
++            list(iter_resp_lines(resp))
++
++
++# ---------------------------------------------------------------------------
++# Integration tests through Watch.stream
++# ---------------------------------------------------------------------------
++
++class WatchStreamChunkTests(unittest.TestCase):
++    """Integration tests that exercise chunk-boundary handling end-to-end
++    through Watch.stream(), verifying that correctly decoded events are
++    yielded to consumers.
++    """
++
++    _POD_LIST_DOC = ':rtype: V1PodList'
++    _CM_LIST_DOC = ':rtype: V1ConfigMapList'
++
++    # -- split event integration ---------------------------------------------
++
++    def test_watch_single_event_split_across_two_chunks(self):
++        json_line = (
++            '{"type":"ADDED","object":{"metadata":{"name":"split-pod",'
++            '"resourceVersion":"100"}}}\n'
++        )
++        mid = len(json_line) // 2
++        chunks = [json_line[:mid].encode(), json_line[mid:].encode()]
++        resp = _fake_resp(chunks)
++        api = _fake_api(resp, self._POD_LIST_DOC)
++
++        w = Watch()
++        events = [e for e in w.stream(api.list_resources, timeout_seconds=1) if e is not None]
++
++        self.assertEqual(1, len(events))
++        self.assertEqual('ADDED', events[0]['type'])
++        self.assertEqual('split-pod', events[0]['object'].metadata.name)
++        self.assertEqual('100', events[0]['object'].metadata.resource_version)
++        self.assertEqual('100', w.resource_version)
++
++    def test_watch_event_split_across_many_small_chunks(self):
++        json_line = (
++            '{"type":"MODIFIED","object":{"metadata":{"name":"fragmented",'
++            '"resourceVersion":"200"}}}\n'
++        )
++        # 4-byte chunks
++        chunks = [json_line[i:i + 4].encode() for i in range(0, len(json_line), 4)]
++        resp = _fake_resp(chunks)
++        api = _fake_api(resp, self._POD_LIST_DOC)
++
++        w = Watch()
++        events = [e for e in w.stream(api.list_resources, timeout_seconds=1) if e is not None]
++
++        self.assertEqual(1, len(events))
++        self.assertEqual('fragmented', events[0]['object'].metadata.name)
++
++    # -- multiple events per chunk integration --------------------------------
++
++    def test_watch_multiple_events_in_single_chunk(self):
++        chunk = (
++            '{"type":"ADDED","object":{"metadata":{"name":"alpha","resourceVersion":"1"}}}\n'
++            '{"type":"MODIFIED","object":{"metadata":{"name":"beta","resourceVersion":"2"}}}\n'
++            '{"type":"DELETED","object":{"metadata":{"name":"gamma","resourceVersion":"3"}}}\n'
++        )
++        resp = _fake_resp([chunk])
++        api = _fake_api(resp, self._POD_LIST_DOC)
++
++        w = Watch()
++        events = [e for e in w.stream(api.list_resources, timeout_seconds=1) if e is not None]
++
++        self.assertEqual(3, len(events))
++        self.assertEqual('alpha', events[0]['object'].metadata.name)
++        self.assertEqual('beta', events[1]['object'].metadata.name)
++        self.assertEqual('gamma', events[2]['object'].metadata.name)
++        # resource_version must track the last event's value
++        self.assertEqual('3', w.resource_version)
++
++    # -- empty chunks integration --------------------------------------------
++
++    def test_watch_empty_byte_chunks_between_events(self):
++        chunks = [
++            b'',
++            b'{"type":"ADDED","object":{"metadata":{"name":"p1","resourceVersion":"1"}}}\n',
++            b'',
++            b'',
++            b'{"type":"ADDED","object":{"metadata":{"name":"p2","resourceVersion":"2"}}}\n',
++            b'',
++        ]
++        resp = _fake_resp(chunks)
++        api = _fake_api(resp, self._POD_LIST_DOC)
++
++        w = Watch()
++        events = [e for e in w.stream(api.list_resources, timeout_seconds=1) if e is not None]
++
++        self.assertEqual(2, len(events))
++        self.assertEqual('p1', events[0]['object'].metadata.name)
++        self.assertEqual('p2', events[1]['object'].metadata.name)
++
++    # -- UTF-8 split integration ---------------------------------------------
++
++    def test_watch_utf8_copyright_split_across_chunk_boundary(self):
++        """©  (U+00A9, \xC2\xA9) split between its two bytes; must survive round-trip."""
++        event_str = (
++            '{"type":"MODIFIED","object":{"metadata":{"name":"cm-utf8","resourceVersion":"42"},'
++            '"data":{"notice":"\u00a9 2024 Example"}}}\n'
++        )
++        raw = event_str.encode('utf-8')
++        split = raw.index(b'\xc2')
++        # chunk 1 ends with \xC2 (first byte of ©)
++        # chunk 2 starts with \xA9 (second byte of ©)
++        resp = _fake_resp([raw[:split + 1], raw[split + 1:]])
++        fake_resp_obj = resp
++
++        fake_api = Mock()
++        fake_api.list_configmaps = Mock(return_value=fake_resp_obj)
++        fake_api.list_configmaps.__doc__ = self._CM_LIST_DOC
++
++        w = Watch()
++        events = [e for e in w.stream(fake_api.list_configmaps, timeout_seconds=1) if e is not None]
++
++        self.assertEqual(1, len(events))
++        self.assertEqual('cm-utf8', events[0]['object'].metadata.name)
++        self.assertEqual('\u00a9 2024 Example', events[0]['object'].data['notice'])
++
++    def test_watch_utf8_euro_split_between_bytes_two_and_three(self):
++        """€ (U+20AC, \xE2\x82\xAC) split after its second byte."""
++        event_str = (
++            '{"type":"MODIFIED","object":{"metadata":{"name":"cm-euro","resourceVersion":"55"},'
++            '"data":{"amount":"\u20ac 42.00"}}}\n'
++        )
++        raw = event_str.encode('utf-8')
++        euro_idx = raw.index(b'\xe2')
++        # Split after \xE2\x82 (first two of three bytes)
++        resp = _fake_resp([raw[:euro_idx + 2], raw[euro_idx + 2:]])
++
++        fake_api = Mock()
++        fake_api.list_configmaps = Mock(return_value=resp)
++        fake_api.list_configmaps.__doc__ = self._CM_LIST_DOC
++
++        w = Watch()
++        events = [e for e in w.stream(fake_api.list_configmaps, timeout_seconds=1) if e is not None]
++
++        self.assertEqual(1, len(events))
++        self.assertEqual('\u20ac 42.00', events[0]['object'].data['amount'])
++
++    def test_watch_utf8_split_event_followed_by_clean_event(self):
++        """After a UTF-8-split event, the next clean event must be delivered correctly."""
++        e1 = (
++            '{"type":"MODIFIED","object":{"metadata":{"name":"cm-a","resourceVersion":"1"},'
++            '"data":{"k":"\u00a9"}}}\n'
++        )
++        e2 = (
++            '{"type":"ADDED","object":{"metadata":{"name":"cm-b","resourceVersion":"2"}}}\n'
++        )
++        raw = (e1 + e2).encode('utf-8')
++        split = raw.index(b'\xc2')
++        resp = _fake_resp([raw[:split + 1], raw[split + 1:]])
++
++        fake_api = Mock()
++        fake_api.list_configmaps = Mock(return_value=resp)
++        fake_api.list_configmaps.__doc__ = self._CM_LIST_DOC
++
++        w = Watch()
++        events = [e for e in w.stream(fake_api.list_configmaps, timeout_seconds=1) if e is not None]
++
++        self.assertEqual(2, len(events))
++        self.assertEqual('cm-a', events[0]['object'].metadata.name)
++        self.assertEqual('\u00a9', events[0]['object'].data['k'])
++        self.assertEqual('cm-b', events[1]['object'].metadata.name)
++
++    # -- ordering preservation integration -----------------------------------
++
++    def test_watch_ordering_preserved_irregular_chunks(self):
++        """5 events in 37-byte chunks; delivered order must match emission order."""
++        names = ['alpha', 'bravo', 'charlie', 'delta', 'echo']
++        events_json = ''.join(
++            '{"type":"ADDED","object":{"metadata":{"name":"%s","resourceVersion":"%d"}}}\n' % (n, i + 1)
++            for i, n in enumerate(names)
++        )
++        data = events_json.encode('utf-8')
++        chunks = [data[i:i + 37] for i in range(0, len(data), 37)]
++
++        resp = _fake_resp(chunks)
++        api = _fake_api(resp, self._POD_LIST_DOC)
++
++        w = Watch()
++        events = [e for e in w.stream(api.list_resources, timeout_seconds=1) if e is not None]
++
++        self.assertEqual(5, len(events))
++        for i, name in enumerate(names):
++            self.assertEqual(name, events[i]['object'].metadata.name,
++                             msg='Event %d out of order' % i)
++            self.assertEqual(str(i + 1), events[i]['object'].metadata.resource_version)
++
++    def test_watch_resource_version_updated_through_chunked_stream(self):
++        """resource_version must be set to the last event's value after chunked delivery."""
++        events_json = ''.join(
++            '{"type":"ADDED","object":{"metadata":{"name":"p%d","resourceVersion":"%d"}}}\n' % (i, i * 10)
++            for i in range(1, 6)
++        )
++        data = events_json.encode('utf-8')
++        # Split at every 20 bytes to ensure cross-boundary parsing
++        chunks = [data[i:i + 20] for i in range(0, len(data), 20)]
++
++        resp = _fake_resp(chunks)
++        api = _fake_api(resp, self._POD_LIST_DOC)
++
++        w = Watch()
++        events = [e for e in w.stream(api.list_resources, timeout_seconds=1) if e is not None]
++
++        self.assertEqual(5, len(events))
++        self.assertEqual('50', w.resource_version)
++
++    # -- partial event at end of stream (no trailing newline) ----------------
++
++    def test_iter_resp_lines_partial_buffer_at_stream_end(self):
++        """Data buffered without a trailing newline must not silently vanish.
++
++        A well-behaved Kubernetes API server always terminates events with \\n,
++        but a server that closes the connection mid-event should not silently
++        drop the partial content without giving iter_resp_lines a chance to
++        flush.  This test verifies that a complete JSON object delivered in
++        chunks without a trailing newline is still yielded.
++        """
++        # Complete JSON, but no trailing newline — simulates a server that
++        # closes the connection immediately after the last byte of the object.
++        raw = b'{"type":"ADDED","object":{"metadata":{"name":"final","resourceVersion":"99"}}}'
++        # Split into three chunks with no trailing \n anywhere
++        resp = _fake_resp([raw[:30], raw[30:60], raw[60:]])
++        lines = [l for l in iter_resp_lines(resp) if l]
++        # The implementation must flush the buffer and yield the line.
++        self.assertEqual(1, len(lines))
++        parsed = json.loads(lines[0])
++        self.assertEqual('final', parsed['object']['metadata']['name'])
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..ba168888
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,60 @@
++#!/usr/bin/env bash
++# test.sh — Mars challenge runner for kubernetes/watch stream chunk parser
++#
++# Usage:
++#   ./test.sh --output_path results.xml base
++#   ./test.sh --output_path results.xml new
++#
++# base: existing regression suite (watch_test.py) — must PASS on original state
++# new:  new chunk-boundary tests (watch_stream_test.py) — must FAIL before
++#       solution.patch is applied, PASS after
++
++set -euo pipefail
++
++OUTPUT_PATH=""
++MODE=""
++
++while [[ $# -gt 0 ]]; do
++    case "$1" in
++        --output_path) OUTPUT_PATH="$2"; shift 2 ;;
++        base|new)      MODE="$1"; shift ;;
++        *) echo "Unknown argument: $1" >&2; exit 1 ;;
++    esac
++done
++
++if [[ -z "$MODE" || -z "$OUTPUT_PATH" ]]; then
++    echo "Usage: $0 --output_path <path> <base|new>" >&2
++    exit 1
++fi
++
++REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++
++PYTHON="${PYTHON:-python3}"
++if [[ -x "/workspace/venv/bin/python" ]]; then
++    PYTHON="/workspace/venv/bin/python"
++fi
++
++case "$MODE" in
++    base)
++        TARGET="$REPO_ROOT/kubernetes/base/watch/watch_test.py"
++        SUITE="watch_regression"
++        ;;
++    new)
++        TARGET="$REPO_ROOT/kubernetes/base/watch/watch_shipd_stream_test.py"
++        SUITE="watch_stream_chunk_tests"
++        ;;
++    *)
++        echo "Unknown mode: $MODE" >&2; exit 1 ;;
++esac
++
++set +e
++"$PYTHON" -m pytest \
++    "$TARGET" \
++    --tb=short \
++    -v \
++    "--junitxml=${OUTPUT_PATH}" \
++    "-o" "junit_suite_name=${SUITE}"
++EXIT_CODE=$?
++set -e
++
++exit $EXIT_CODE
