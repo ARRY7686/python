@@ -1,179 +1,63 @@
+diff --git a/kubernetes/informer/cache.py b/kubernetes/informer/cache.py
+index 137c6f77..73c27541 100644
+--- a/kubernetes/informer/cache.py
++++ b/kubernetes/informer/cache.py
+@@ -53,6 +53,7 @@ class ObjectCache:
+         self._key_func = key_func if key_func is not None else _meta_namespace_key
+         self._objects = {}
+         self._rlock = threading.RLock()
++        self._populated = False  # set to True after the first _replace_all call
+ 
+     # --- mutation helpers (called by SharedInformer) ---
+ 
+@@ -70,6 +71,12 @@ class ObjectCache:
+         rebuilt = {self._key_func(o): o for o in objects}
+         with self._rlock:
+             self._objects = rebuilt
++            self._populated = True
++
++    def has_synced(self):
++        """Return True if this cache has been populated at least once."""
++        with self._rlock:
++            return self._populated
+ 
+     # --- public read API ---
+ 
 diff --git a/kubernetes/informer/informer.py b/kubernetes/informer/informer.py
-index e3de9940..f0e83000 100644
+index f0e83000..a7a6d358 100644
 --- a/kubernetes/informer/informer.py
 +++ b/kubernetes/informer/informer.py
-@@ -173,20 +173,79 @@ class SharedInformer:
-         return kw
+@@ -91,6 +91,7 @@ class SharedInformer:
+         self._thread = None
+         self._stop_event = threading.Event()
+         self._resource_version = None  # most recent RV seen; None forces a full re-list
++        self._watch_factory = Watch  # injectable; called once per watch cycle
  
-     def _fire(self, event_type, obj):
--        """Invoke handlers for the given event type."""
--        for fn in self._handlers.get(event_type, []):
--            fn(obj)
-+        """Execute all registered callbacks for *event_type*, passing *obj*.
+     # ---------------------------------------------------------------- #
+     # Public API                                                        #
+@@ -101,6 +102,16 @@ class SharedInformer:
+         """The :class:`ObjectCache` maintained by this informer."""
+         return self._cache
+ 
++    def has_synced(self):
++        """Return True once the first full list has been completed.
 +
-+        Callbacks are invoked sequentially on the informer's background thread.
-+        Any exception raised by an individual handler is logged and swallowed so
-+        that remaining handlers still run.
++        This mirrors ``HasSynced`` from the Go client-go informer API.  It
++        returns False before :meth:`start` is called or before the first
++        :meth:`_initial_list` completes, and True from that point on (it
++        never flips back to False after reconnects).
 +        """
-+        with self._handler_lock:
-+            handlers = list(self._handlers.get(event_type, []))
-+        for fn in handlers:
-+            try:
-+                fn(obj)
-+            except Exception:
-+                logger.exception(
-+                    "Exception in informer handler for %s", event_type
-+                )
++        return self._cache.has_synced()
++
+     def add_event_handler(self, event_type, handler):
+         """Register a callback for a specific event type.
  
-     def _initial_list(self):
--        """List all objects and populate the local cache."""
-+        """List all objects and populate the cache, firing ADDED/MODIFIED/DELETED events.
-+
-+        On the first call (empty cache) every returned item fires ADDED.
-+        On subsequent calls (resync or after a 410 Gone) the new list is
-+        diffed against the existing cache:
-+        * Items absent from the new list fire DELETED.
-+        * Items present in both fire MODIFIED.
-+        * Items only in the new list fire ADDED.
-+        """
-         kw = self._build_kwargs()
-         resp = self._list_func(**kw)
-         items = getattr(resp, "items", []) or []
-+
-+        # Build key → item map for incoming items.
-+        new_items_map = {}
-+        for item in items:
-+            key = self._cache._key_func(item)
-+            new_items_map[key] = item
-+
-+        # Snapshot the old keys before replacing the cache.
-+        old_keys = set(self._cache.list_keys())
-+
-+        # Fire DELETED for items no longer present in the new list.
-+        for key in old_keys:
-+            if key not in new_items_map:
-+                old_obj = self._cache.get_by_key(key)
-+                if old_obj is not None:
-+                    self._fire(DELETED, old_obj)
-+
-+        # Atomically replace the cache.
-         self._cache._replace_all(items)
+@@ -257,7 +268,7 @@ class SharedInformer:
  
-+        # Fire ADDED for genuinely new items, MODIFIED for existing ones.
-+        for key, item in new_items_map.items():
-+            if key in old_keys:
-+                self._fire(MODIFIED, item)
-+            else:
-+                self._fire(ADDED, item)
-+
-+        rv = None
-+        meta = getattr(resp, "metadata", None)
-+        if meta is not None:
-+            rv = getattr(meta, "resource_version", None)
-+        self._resource_version = rv or "0"
-+
-     def _run_loop(self):
--        """Background loop: list then watch."""
-+        """Background loop: list then watch, reconnect on errors.
-+
-+        A full re-list is only performed when ``self._resource_version`` is
-+        ``None`` (first start or after a 410 Gone response).  On all other
-+        reconnects the most recent ``resourceVersion`` is reused so that no
-+        events are missed and the API server does not need to send a full
-+        object snapshot.
-+        """
-         while not self._stop_event.is_set():
-+            # Full re-list only when we have no resource version to resume from.
-             if self._resource_version is None:
-                 try:
-                     self._initial_list()
-@@ -196,20 +255,88 @@ class SharedInformer:
-                     self._stop_event.wait(timeout=5)
-                     continue
- 
-+            # Watch loop
-+            last_resync = time.monotonic()
-             self._watch = Watch()
+             # Watch loop
+             last_resync = time.monotonic()
+-            self._watch = Watch()
++            self._watch = self._watch_factory()
              kw = self._build_kwargs()
--            kw["resource_version"] = self._resource_version or "0"
-+            kw["resource_version"] = self._resource_version
-+            # When a resync period is configured, set a matching server-side
-+            # watch timeout so that the stream exits after resync_period seconds
-+            # even if no events arrive.  Without this, a quiet period longer
-+            # than resync_period would never trigger a resync because the check
-+            # below only runs when the generator yields an event.
-+            if self._resync_period > 0:
-+                kw["timeout_seconds"] = max(1, int(self._resync_period))
-             try:
-                 for event in self._watch.stream(self._list_func, **kw):
-                     if self._stop_event.is_set():
-                         break
-                     evt_type = event.get("type")
-                     obj = event.get("object")
-+                    # Sync the most recent resource version from the Watch
-+                    # instance (updated by unmarshal_event before yielding).
-+                    # Do this before firing handlers so consumers that wake on
-+                    # an event immediately see the advanced resource version.
-+                    if self._watch is not None and self._watch.resource_version:
-+                        self._resource_version = self._watch.resource_version
-                     if evt_type == ADDED:
-                         self._cache._put(obj)
-                         self._fire(ADDED, obj)
-+                    elif evt_type == MODIFIED:
-+                        self._cache._put(obj)
-+                        self._fire(MODIFIED, obj)
-+                    elif evt_type == DELETED:
-+                        self._cache._remove(obj)
-+                        self._fire(DELETED, obj)
-+                    elif evt_type == BOOKMARK:
-+                        # BOOKMARK events carry an updated resource version but
-+                        # no object state change; the Watch instance already
-+                        # records the new resource_version internally.
-+                        self._fire(BOOKMARK, event.get("raw_object", obj))
-+                    elif evt_type == ERROR:
-+                        self._fire(ERROR, obj)
-+            except ApiException as exc:
-+                if exc.status == 410:
-+                    # The stored resource version is too old; force a full re-list.
-+                    logger.warning(
-+                        "Watch expired (410 Gone); will re-list from scratch"
-+                    )
-+                    self._resource_version = None
-+                else:
-+                    logger.warning(
-+                        "Watch stream ended with ApiException (status=%s); reconnecting",
-+                        exc.status,
-+                    )
-+                self._fire(ERROR, exc)
-             except Exception as exc:
-                 logger.exception("Unexpected error in watch loop; reconnecting")
-                 self._fire(ERROR, exc)
-             finally:
-+                # Capture the most recent resource version seen by the Watch
-+                # (updated on every ADDED/MODIFIED/DELETED/BOOKMARK event) so
-+                # that the next watch connection can resume without re-listing.
-+                # Do not overwrite a None that was set by a 410 handler above.
-+                if (
-+                    self._resource_version is not None
-+                    and self._watch is not None
-+                    and self._watch.resource_version
-+                ):
-+                    self._resource_version = self._watch.resource_version
-                 self._watch = None
-+
-+            # Periodic resync: after the watch stream exits (whether due to the
-+            # server-side timeout_seconds, a stop request, or an error) check if
-+            # a resync is due.  This path is what actually fires the resync when
-+            # the cluster is quiet and no events arrive for resync_period seconds.
-+            if (
-+                not self._stop_event.is_set()
-+                and self._resource_version is not None  # 410 already schedules a re-list
-+                and self._resync_period > 0
-+                and (time.monotonic() - last_resync) >= self._resync_period
-+            ):
-+                logger.debug("Informer resync triggered")
-+                try:
-+                    self._initial_list()
-+                except Exception as exc:
-+                    logger.exception("Error during resync list; continuing")
-+                    self._fire(ERROR, exc)
+             kw["resource_version"] = self._resource_version
+             # When a resync period is configured, set a matching server-side

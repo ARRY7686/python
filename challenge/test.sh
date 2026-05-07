@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# test.sh — Mars evaluation harness for the SharedInformer challenge
+# test.sh — Mars evaluation harness for the SharedInformer has_synced challenge
 #
 # Usage:
 #   ./test.sh --output_path <junit-xml-path> base|new
 #
 # Modes:
-#   base — ObjectCache + MetaNamespaceKey unit tests (pass with any impl)
-#   new  — Full SharedInformer test suite (41 tests; requires correct impl)
+#   base — stable upstream unit tests (ObjectCache, handlers, MetaNamespaceKey)
+#          PASS on clean repo
+#   new  — newly added Mars tests (test_informer_mars.py)
+#          FAIL on clean repo, PASS after solution.patch
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -22,16 +24,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$MODE" ]]; then
-    echo "Usage: $0 --output_path PATH base|new" >&2
-    exit 1
-fi
-if [[ -z "$OUTPUT_PATH" ]]; then
+if [[ -z "$MODE" || -z "$OUTPUT_PATH" ]]; then
     echo "Usage: $0 --output_path PATH base|new" >&2
     exit 1
 fi
 
-# Resolve Python interpreter
 PYTHON="${PYTHON:-}"
 if [[ -z "$PYTHON" && -x /workspace/venv/bin/python ]]; then
     PYTHON=/workspace/venv/bin/python
@@ -44,18 +41,14 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
 if [[ "$MODE" == "base" ]]; then
-    # Stable tests that verify ObjectCache and the handler registration API.
-    # These pass with any (even broken) implementation of _fire/_initial_list/_run_loop.
     exec "$PYTHON" -m pytest \
         kubernetes/test/test_informer.py \
-        -k "TestObjectCache or TestMetaNamespaceKey" \
+        -k "TestObjectCache or TestMetaNamespaceKey or TestSharedInformerHandlers" \
         --junitxml="$OUTPUT_PATH" \
         -v
 else
-    # Full SharedInformer test suite.
-    # A correct implementation must pass all 41 tests.
     exec "$PYTHON" -m pytest \
-        kubernetes/test/test_informer.py \
+        kubernetes/test/test_informer_mars.py \
         --junitxml="$OUTPUT_PATH" \
         -v
 fi

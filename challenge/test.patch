@@ -1,67 +1,443 @@
-diff --git a/test.sh b/test.sh
-new file mode 100755
-index 00000000..eb501cf0
+diff --git a/kubernetes/test/test_informer_mars.py b/kubernetes/test/test_informer_mars.py
+new file mode 100644
+index 00000000..1a6ee71f
 --- /dev/null
-+++ b/test.sh
-@@ -0,0 +1,61 @@
-+#!/usr/bin/env bash
-+# ---------------------------------------------------------------------------
-+# test.sh — Mars evaluation harness for the SharedInformer challenge
++++ b/kubernetes/test/test_informer_mars.py
+@@ -0,0 +1,437 @@
++# Copyright 2026 The Kubernetes Authors.
 +#
-+# Usage:
-+#   ./test.sh --output_path <junit-xml-path> base|new
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
 +#
-+# Modes:
-+#   base — ObjectCache + MetaNamespaceKey unit tests (pass with any impl)
-+#   new  — Full SharedInformer test suite (41 tests; requires correct impl)
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Mars challenge tests for SharedInformer.
++
++These tests expose REAL missing behavior in the Python Kubernetes
++SharedInformer implementation:
++
++  1. ``ObjectCache.has_synced()`` — absent from the clean repo; the cache
++     must track whether it has been populated at least once via
++     ``_replace_all`` so that consumers can gate work behind a sync check.
++
++  2. ``SharedInformer.has_synced()`` — absent from the clean repo; must
++     return False before the first ``_initial_list()`` completes and True
++     afterwards, and must survive reconnects without flipping back to False.
++
++  3. ``SharedInformer._watch_factory`` — absent from the clean repo; a
++     callable attribute that the run-loop uses to instantiate a Watch.
++     Without it, unit tests cannot inject a deterministic fake Watch and
++     must resort to patching the module-level name (which is fragile).
++
++All tests are fully synchronous (no real threads, no network, no sleep).
++They FAIL on the clean repository and PASS after the reference solution.
++"""
++
++import threading
++import unittest
++from unittest.mock import MagicMock, patch
++
++from kubernetes.informer.cache import ObjectCache
++from kubernetes.informer.informer import (
++    ADDED,
++    BOOKMARK,
++    DELETED,
++    MODIFIED,
++    SharedInformer,
++)
++
++
++def _make_pod(namespace, name, rv="1"):
++    return {"metadata": {"namespace": namespace, "name": name,
++                         "resourceVersion": rv}}
++
++
 +# ---------------------------------------------------------------------------
-+set -euo pipefail
++# Group 1 – ObjectCache.has_synced()
++# ---------------------------------------------------------------------------
 +
-+OUTPUT_PATH=""
-+MODE=""
++class TestObjectCacheHasSynced(unittest.TestCase):
++    """ObjectCache must expose a has_synced() predicate.
 +
-+while [[ $# -gt 0 ]]; do
-+    case "$1" in
-+        --output_path) OUTPUT_PATH="$2"; shift 2 ;;
-+        base|new)      MODE="$1";        shift   ;;
-+        *)             shift                      ;;
-+    esac
-+done
++    ``has_synced()`` returns False when the cache is first created and
++    True after at least one successful ``_replace_all`` call.  It never
++    flips back to False.
++    """
 +
-+if [[ -z "$MODE" ]]; then
-+    echo "Usage: $0 --output_path PATH base|new" >&2
-+    exit 1
-+fi
-+if [[ -z "$OUTPUT_PATH" ]]; then
-+    echo "Usage: $0 --output_path PATH base|new" >&2
-+    exit 1
-+fi
++    def test_has_synced_exists(self):
++        """ObjectCache must have a callable has_synced attribute."""
++        cache = ObjectCache()
++        self.assertTrue(
++            callable(getattr(cache, "has_synced", None)),
++            "ObjectCache.has_synced() is missing — add the method",
++        )
 +
-+# Resolve Python interpreter
-+PYTHON="${PYTHON:-}"
-+if [[ -z "$PYTHON" && -x /workspace/venv/bin/python ]]; then
-+    PYTHON=/workspace/venv/bin/python
-+fi
-+if [[ -z "$PYTHON" ]]; then
-+    PYTHON=python3
-+fi
++    def test_has_synced_false_before_populate(self):
++        """has_synced() must return False on a freshly created cache."""
++        cache = ObjectCache()
++        self.assertFalse(
++            cache.has_synced(),
++            "has_synced() must be False before _replace_all is called",
++        )
 +
-+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-+cd "$REPO_ROOT"
++    def test_has_synced_true_after_replace_all_with_items(self):
++        """has_synced() must return True after _replace_all with non-empty list."""
++        cache = ObjectCache()
++        pod = _make_pod("default", "pod1")
++        cache._replace_all([pod])
++        self.assertTrue(
++            cache.has_synced(),
++            "has_synced() must be True after _replace_all([<items>])",
++        )
 +
-+if [[ "$MODE" == "base" ]]; then
-+    # Stable tests that verify ObjectCache and the handler registration API.
-+    # These pass with any (even broken) implementation of _fire/_initial_list/_run_loop.
-+    exec "$PYTHON" -m pytest \
-+        kubernetes/test/test_informer.py \
-+        -k "TestObjectCache or TestMetaNamespaceKey" \
-+        --junitxml="$OUTPUT_PATH" \
-+        -v
-+else
-+    # Full SharedInformer test suite.
-+    # A correct implementation must pass all 41 tests.
-+    exec "$PYTHON" -m pytest \
-+        kubernetes/test/test_informer.py \
-+        --junitxml="$OUTPUT_PATH" \
-+        -v
-+fi
++    def test_has_synced_true_after_replace_all_with_empty_list(self):
++        """has_synced() must return True even when _replace_all is called with [].
++
++        An empty list is a valid list result (the namespace has no objects);
++        it still means the cache has been synchronised at least once.
++        """
++        cache = ObjectCache()
++        cache._replace_all([])
++        self.assertTrue(
++            cache.has_synced(),
++            "has_synced() must be True after _replace_all([]) (empty list is valid)",
++        )
++
++    def test_has_synced_stays_true_after_second_replace_all(self):
++        """has_synced() must stay True across subsequent _replace_all calls."""
++        cache = ObjectCache()
++        cache._replace_all([_make_pod("default", "pod1")])
++        cache._replace_all([_make_pod("default", "pod2")])
++        self.assertTrue(cache.has_synced())
++
++    def test_has_synced_stays_true_after_remove(self):
++        """has_synced() must stay True even after all objects are removed."""
++        cache = ObjectCache()
++        pod = _make_pod("default", "pod1")
++        cache._replace_all([pod])
++        cache._remove(pod)
++        self.assertTrue(
++            cache.has_synced(),
++            "has_synced() must not reset to False when objects are removed",
++        )
++
++    def test_has_synced_thread_safety(self):
++        """has_synced() must be safe to call from many threads concurrently."""
++        cache = ObjectCache()
++        errors = []
++
++        def populate():
++            try:
++                cache._replace_all([_make_pod("default", "pod1")])
++            except Exception as exc:
++                errors.append(exc)
++
++        def check():
++            try:
++                cache.has_synced()  # may return True or False — must not raise
++            except Exception as exc:
++                errors.append(exc)
++
++        threads = [threading.Thread(target=populate if i == 0 else check)
++                   for i in range(20)]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++
++        self.assertEqual(errors, [], f"Unexpected exception in thread: {errors}")
++
++
++# ---------------------------------------------------------------------------
++# Group 2 – SharedInformer.has_synced()
++# ---------------------------------------------------------------------------
++
++class TestSharedInformerHasSynced(unittest.TestCase):
++    """SharedInformer must expose a has_synced() predicate.
++
++    ``has_synced()`` returns False before the informer's background loop
++    completes its first ``_initial_list()`` call and True afterwards.  It
++    must never flip back to False on reconnect.
++    """
++
++    def _make_informer(self, items=None, rv="1"):
++        list_func = MagicMock()
++        list_resp = MagicMock()
++        list_resp.items = items or []
++        list_resp.metadata = MagicMock(resource_version=rv)
++        list_func.return_value = list_resp
++        return SharedInformer(list_func=list_func), list_func
++
++    def test_has_synced_exists(self):
++        """SharedInformer must have a callable has_synced attribute."""
++        informer, _ = self._make_informer()
++        self.assertTrue(
++            callable(getattr(informer, "has_synced", None)),
++            "SharedInformer.has_synced() is missing — add the method",
++        )
++
++    def test_has_synced_false_before_start(self):
++        """has_synced() must return False before start() is ever called."""
++        informer, _ = self._make_informer()
++        self.assertFalse(
++            informer.has_synced(),
++            "has_synced() must be False before the informer has started",
++        )
++
++    def test_has_synced_true_after_initial_list(self):
++        """has_synced() must return True after _initial_list() completes."""
++        informer, _ = self._make_informer(items=[_make_pod("default", "pod1")])
++
++        with patch("kubernetes.informer.informer.Watch") as MockWatch:
++            mock_w = MagicMock()
++
++            def fake_stream(func, **kw):
++                informer._stop_event.set()
++                return iter([])
++
++            mock_w.stream.side_effect = fake_stream
++            mock_w.resource_version = "1"
++            MockWatch.return_value = mock_w
++
++            informer.start()
++            informer._thread.join(timeout=3)
++
++        self.assertTrue(
++            informer.has_synced(),
++            "has_synced() must be True after the first _initial_list() completes",
++        )
++
++    def test_has_synced_true_even_with_empty_list(self):
++        """has_synced() must return True even when the initial list is empty."""
++        informer, _ = self._make_informer(items=[])
++
++        with patch("kubernetes.informer.informer.Watch") as MockWatch:
++            mock_w = MagicMock()
++
++            def fake_stream(func, **kw):
++                informer._stop_event.set()
++                return iter([])
++
++            mock_w.stream.side_effect = fake_stream
++            mock_w.resource_version = "1"
++            MockWatch.return_value = mock_w
++
++            informer.start()
++            informer._thread.join(timeout=3)
++
++        self.assertTrue(
++            informer.has_synced(),
++            "has_synced() must be True after an empty _initial_list() completes",
++        )
++
++    def test_has_synced_stays_true_after_reconnect(self):
++        """has_synced() must stay True across watch reconnects."""
++        from kubernetes.client.exceptions import ApiException
++
++        informer, _ = self._make_informer()
++        stream_calls = {"n": 0}
++
++        with patch("kubernetes.informer.informer.Watch") as MockWatch:
++            mock_w = MagicMock()
++            mock_w.resource_version = "1"
++
++            def fake_stream(func, **kw):
++                stream_calls["n"] += 1
++                if stream_calls["n"] == 1:
++                    raise ApiException(status=409, reason="Conflict")
++                informer._stop_event.set()
++                return iter([])
++
++            mock_w.stream.side_effect = fake_stream
++            MockWatch.return_value = mock_w
++
++            informer.start()
++            informer._thread.join(timeout=3)
++
++        self.assertTrue(
++            informer.has_synced(),
++            "has_synced() must remain True after a watch reconnect",
++        )
++
++    def test_has_synced_false_direct_call(self):
++        """Calling has_synced() on a fresh informer without starting returns False."""
++        informer, _ = self._make_informer()
++        # Never call start() — synced must be False
++        self.assertFalse(informer.has_synced())
++
++    def test_has_synced_delegates_to_cache(self):
++        """has_synced() on the informer must reflect the cache's own has_synced().
++
++        After manually calling _initial_list(), both the informer and its
++        cache must agree on the synced state.
++        """
++        informer, _ = self._make_informer(items=[_make_pod("default", "x")])
++        informer._initial_list()
++
++        cache_synced = informer.cache.has_synced()
++        informer_synced = informer.has_synced()
++        self.assertTrue(cache_synced,
++                        "cache.has_synced() must be True after _initial_list()")
++        self.assertTrue(informer_synced,
++                        "informer.has_synced() must be True after _initial_list()")
++        self.assertEqual(cache_synced, informer_synced,
++                         "informer.has_synced() and cache.has_synced() must agree")
++
++
++# ---------------------------------------------------------------------------
++# Group 3 – SharedInformer._watch_factory
++# ---------------------------------------------------------------------------
++
++class TestSharedInformerWatchFactory(unittest.TestCase):
++    """SharedInformer must support an injectable _watch_factory.
++
++    The ``_watch_factory`` attribute is a zero-argument callable that the
++    run-loop calls to create a new Watch instance for each watch cycle.
++    Defaulting to ``Watch`` (the real implementation), it can be replaced
++    in tests with a factory that returns a deterministic mock — without
++    patching the module-level ``Watch`` symbol.
++
++    This is the standard pattern used in Go's fake-client informer tests
++    and prevents tests from being coupled to import paths.
++    """
++
++    def _make_informer(self, items=None, rv="1"):
++        list_func = MagicMock()
++        list_resp = MagicMock()
++        list_resp.items = items or []
++        list_resp.metadata = MagicMock(resource_version=rv)
++        list_func.return_value = list_resp
++        return SharedInformer(list_func=list_func), list_func
++
++    def test_watch_factory_attribute_exists(self):
++        """SharedInformer must have a _watch_factory attribute."""
++        informer, _ = self._make_informer()
++        self.assertTrue(
++            hasattr(informer, "_watch_factory"),
++            "_watch_factory attribute is missing from SharedInformer",
++        )
++
++    def test_watch_factory_is_callable(self):
++        """_watch_factory must be a callable."""
++        informer, _ = self._make_informer()
++        self.assertTrue(
++            callable(informer._watch_factory),
++            "_watch_factory must be callable (should default to Watch class)",
++        )
++
++    def test_watch_factory_default_returns_watch_instance(self):
++        """The default _watch_factory() must return a Watch instance."""
++        from kubernetes.watch import Watch
++
++        informer, _ = self._make_informer()
++        instance = informer._watch_factory()
++        self.assertIsInstance(
++            instance, Watch,
++            "_watch_factory() default must return a kubernetes.watch.Watch instance",
++        )
++
++    def test_watch_factory_injectable(self):
++        """_watch_factory can be replaced to inject a fake Watch."""
++        informer, _ = self._make_informer()
++
++        factory_called = {"n": 0}
++        mock_watch = MagicMock()
++        mock_watch.resource_version = "1"
++
++        def fake_stream(func, **kw):
++            informer._stop_event.set()
++            return iter([])
++
++        mock_watch.stream.side_effect = fake_stream
++
++        def fake_factory():
++            factory_called["n"] += 1
++            return mock_watch
++
++        informer._watch_factory = fake_factory
++
++        informer.start()
++        informer._thread.join(timeout=3)
++
++        self.assertGreaterEqual(
++            factory_called["n"], 1,
++            "_watch_factory must be called by the run-loop to create each Watch",
++        )
++
++    def test_watch_factory_events_delivered_via_injected_watch(self):
++        """Events from an injected Watch are delivered to handlers correctly."""
++        pod = _make_pod("default", "factory-pod")
++        informer, _ = self._make_informer()
++
++        received = []
++        informer.add_event_handler(ADDED, received.append)
++
++        mock_watch = MagicMock()
++        mock_watch.resource_version = "1"
++
++        def fake_stream(func, **kw):
++            yield {"type": "ADDED", "object": pod}
++            informer._stop_event.set()
++
++        mock_watch.stream.side_effect = fake_stream
++        informer._watch_factory = lambda: mock_watch
++
++        informer.start()
++        informer._thread.join(timeout=3)
++
++        self.assertIn(
++            pod, received,
++            "ADDED event from injected Watch must be delivered to handler",
++        )
++        self.assertIn(
++            pod, informer.cache.list(),
++            "ADDED event from injected Watch must populate the cache",
++        )
++
++    def test_watch_factory_called_each_reconnect(self):
++        """_watch_factory must be called once per watch cycle (including reconnects)."""
++        from kubernetes.client.exceptions import ApiException
++
++        informer, _ = self._make_informer()
++
++        factory_called = {"n": 0}
++        stream_calls = {"n": 0}
++
++        def make_mock():
++            mock_watch = MagicMock()
++            mock_watch.resource_version = "1"
++
++            def fake_stream(func, **kw):
++                stream_calls["n"] += 1
++                if stream_calls["n"] == 1:
++                    raise ApiException(status=409, reason="Conflict")
++                informer._stop_event.set()
++                return iter([])
++
++            mock_watch.stream.side_effect = fake_stream
++            return mock_watch
++
++        def fake_factory():
++            factory_called["n"] += 1
++            return make_mock()
++
++        informer._watch_factory = fake_factory
++
++        informer.start()
++        informer._thread.join(timeout=3)
++
++        self.assertGreaterEqual(
++            factory_called["n"], 2,
++            "_watch_factory must be called for each watch cycle including reconnects",
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
