@@ -1,60 +1,10 @@
-diff --git a/test.sh b/test.sh
-new file mode 100755
-index 00000000..18197ecc
---- /dev/null
-+++ b/test.sh
-@@ -0,0 +1,54 @@
-+#!/usr/bin/env bash
-+# ---------------------------------------------------------------------------
-+# test.sh — Mars evaluation harness for the SharedInformer has_synced challenge
-+#
-+# Usage:
-+#   ./test.sh --output_path <junit-xml-path> base|new
-+#
-+# Modes:
-+#   base — stable upstream unit tests (ObjectCache, handlers, MetaNamespaceKey)
-+#          PASS on clean repo
-+#   new  — newly added Mars tests (test_informer_mars.py)
-+#          FAIL on clean repo, PASS after solution.patch
-+# ---------------------------------------------------------------------------
-+set -euo pipefail
-+
-+OUTPUT_PATH=""
-+MODE=""
-+
-+while [[ $# -gt 0 ]]; do
-+    case "$1" in
-+        --output_path) OUTPUT_PATH="$2"; shift 2 ;;
-+        base|new)      MODE="$1";        shift   ;;
-+        *)             shift                      ;;
-+    esac
-+done
-+
-+if [[ -z "$MODE" || -z "$OUTPUT_PATH" ]]; then
-+    echo "Usage: $0 --output_path PATH base|new" >&2
-+    exit 1
-+fi
-+
-+PYTHON="${PYTHON:-}"
-+if [[ -z "$PYTHON" && -x /workspace/venv/bin/python ]]; then
-+    PYTHON=/workspace/venv/bin/python
-+fi
-+if [[ -z "$PYTHON" ]]; then
-+    PYTHON=python3
-+fi
-+
-+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-+cd "$REPO_ROOT"
-+
-+if [[ "$MODE" == "base" ]]; then
-+    exec "$PYTHON" -m pytest \
-+        kubernetes/test/test_informer.py \
-+        -k "TestObjectCache or TestMetaNamespaceKey or TestSharedInformerHandlers" \
-+        --junitxml="$OUTPUT_PATH" \
-+        -v
-+else
-+    exec "$PYTHON" -m pytest \
-+        kubernetes/test/test_informer_mars.py \
-+        --junitxml="$OUTPUT_PATH" \
-+        -v
-+fi
+diff --git a/challenge/problem_statement.md b/challenge/problem_statement.md
+index 3652bd20..a5c360a4 100644
+--- a/challenge/problem_statement.md
++++ b/challenge/problem_statement.md
+@@ -1,4 +1,4 @@
+-# Mars Challenge — Kubernetes SharedInformer: Implement the Core Watch Loop
++# Mars Challenge [SharedInformer has_synced & _watch_factory] — Kubernetes SharedInformer: Implement the Core Watch Loop
+ 
+ ## Background
+ 
